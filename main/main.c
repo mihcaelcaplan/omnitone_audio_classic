@@ -221,7 +221,7 @@ void app_main(void)
         "|      electronics that get better with time       |\n"
         "|                                                  |\n"
         "+~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=+");
-        
+
     // start up the spi handler task to be a peripheral to the NRF chip
     err = init_SPI();
     if(err != ESP_OK){

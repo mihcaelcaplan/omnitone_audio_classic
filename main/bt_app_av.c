@@ -237,6 +237,8 @@ void bt_i2s_driver_install(void)
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
+    ESP_LOGI(BT_AV_TAG, "I2S installed and enabled: bclk %d, ws %d, dout %d",
+             CONFIG_EXAMPLE_I2S_BCK_PIN, CONFIG_EXAMPLE_I2S_LRCK_PIN, CONFIG_EXAMPLE_I2S_DATA_PIN);
 #endif
 }
 
@@ -248,6 +250,7 @@ void bt_i2s_driver_uninstall(void)
 #else
     ESP_ERROR_CHECK(i2s_channel_disable(tx_chan));
     ESP_ERROR_CHECK(i2s_del_channel(tx_chan));
+    tx_chan = NULL;
 #endif
 }
 
@@ -305,8 +308,12 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
         
             if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-            bt_i2s_driver_uninstall();
+            /* stop the writer before destroying what it writes to: the I2S
+             * task runs unpinned at high priority, so on the other core it can
+             * be entering i2s_channel_write() with a handle this task is about
+             * to i2s_del_channel() -> "this channel is not tx channel" */
             bt_i2s_task_shut_down();
+            bt_i2s_driver_uninstall();
             
             status_flags = (status_flags & (~EXT_MCU_BT_FLAG)); // turn off bt flag globally
 
@@ -376,12 +383,30 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             /* Enable the continuous channels */
             dac_continuous_enable(tx_chan);
         #else
-            i2s_channel_disable(tx_chan);
-            i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
-            i2s_std_slot_config_t slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, ch_count);
-            i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
-            i2s_channel_reconfig_std_slot(tx_chan, &slot_cfg);
-            i2s_channel_enable(tx_chan);
+            /* the channel is taken down here and only comes back at the enable
+             * below, so a failure anywhere in between leaves the interface dead
+             * with no clocks on the pins -- these returns must not be dropped */
+            if (tx_chan == NULL) {
+                ESP_LOGE(BT_AV_TAG, "audio cfg arrived with no I2S channel installed");
+            } else {
+                esp_err_t cfg_err;
+                i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
+                i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, ch_count);
+                if ((cfg_err = i2s_channel_disable(tx_chan)) != ESP_OK) {
+                    ESP_LOGE(BT_AV_TAG, "i2s_channel_disable: %s", esp_err_to_name(cfg_err));
+                }
+                if ((cfg_err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg)) != ESP_OK) {
+                    ESP_LOGE(BT_AV_TAG, "i2s_channel_reconfig_std_clock: %s", esp_err_to_name(cfg_err));
+                }
+                if ((cfg_err = i2s_channel_reconfig_std_slot(tx_chan, &slot_cfg)) != ESP_OK) {
+                    ESP_LOGE(BT_AV_TAG, "i2s_channel_reconfig_std_slot: %s", esp_err_to_name(cfg_err));
+                }
+                if ((cfg_err = i2s_channel_enable(tx_chan)) != ESP_OK) {
+                    ESP_LOGE(BT_AV_TAG, "i2s_channel_enable: %s", esp_err_to_name(cfg_err));
+                } else {
+                    ESP_LOGI(BT_AV_TAG, "I2S re-enabled: %d Hz, %d ch", sample_rate, ch_count);
+                }
+            }
         #endif
             ESP_LOGI(BT_AV_TAG, "Configure audio player: 0x%x-0x%x-0x%x-0x%x-0x%x-%d-%d",
                      p_mcc->cie.sbc_info.samp_freq,
@@ -586,8 +611,12 @@ static void bt_av_hdl_avrc_tg_evt(uint16_t event, void *p_param)
         if (rc->conn_stat.connected) {
             /* create task to simulate volume change */ //TODO: add a task here to handle volume control by remote
             // xTaskCreate(volume_change_simulation, "vcsTask", 2048, NULL, 5, &s_vcs_task_hdl);
-        } else {
+        } else if (s_vcs_task_hdl) {
+            /* the create above is commented out, so this handle is NULL --
+             * and vTaskDelete(NULL) deletes the CALLING task, which here is
+             * BtAppTask, silently killing the whole app event pipeline */
             vTaskDelete(s_vcs_task_hdl);
+            s_vcs_task_hdl = NULL;
             ESP_LOGI(BT_RC_TG_TAG, "Stop volume change simulation");
         }
         break;
@@ -663,8 +692,17 @@ void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 
 #if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
 
-TickType_t last_cb;
-
+/*
+ * Decoded PCM arrives here on the BTC task. This is the single fan-out point
+ * for the stream: today it goes straight out I2S to the DSP. Later this
+ * selects between the I2S sink and write_spi_queue() (raw PCM to the nRF for
+ * rebroadcast) -- the SPI bridge task runs alongside as a status machine and
+ * must never contend for this data. Not built yet.
+ *
+ * Note this writes I2S inline, so a DMA stall blocks the Bluetooth stack.
+ * bt_i2s_task_handler() + write_ringbuf() in bt_app_core.c are the decoupled
+ * path if that becomes a problem; they are left in place but unused.
+ */
 void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
     _lock_acquire(&s_volume_lock);
@@ -679,29 +717,20 @@ void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
         }
     }
 
-    #ifdef NRF_SIDECHANNEL_ON
-
-    // send data to the spi work queue
-    write_spi_queue(data, len);
-    
-    /* log the number every 100 packets */
-    if (++s_pkt_cnt % 100 == 0) {
-        ESP_LOGI(BT_AV_TAG, "Audio packet count: %"PRIu32, s_pkt_cnt);
-        ESP_LOGI(BT_AV_TAG, "last_packet_len: %d", len);
-        TickType_t now = xTaskGetTickCount();
-        ESP_LOGI(BT_AV_TAG, "time elapsed: %dms", pdTICKS_TO_MS( now- last_cb));
-        last_cb = now;
-    }
-    
-    #else
-
-        size_t bytes_written;
-        i2s_channel_write(tx_chan, data, len, &bytes_written, portMAX_DELAY);
-        if (++s_pkt_cnt % 100 == 0) {
-            ESP_LOGI(BT_AV_TAG, "Audio packet count %u", s_pkt_cnt);
+    size_t bytes_written = 0;
+    /* uninstall runs on the app task and nulls this on disconnect */
+    if (tx_chan != NULL) {
+        esp_err_t err = i2s_channel_write(tx_chan, data, len, &bytes_written, portMAX_DELAY);
+        if (err != ESP_OK || bytes_written != len) {
+            ESP_LOGW(BT_AV_TAG, "i2s write: %s, %u/%"PRIu32" bytes",
+                     esp_err_to_name(err), (unsigned)bytes_written, len);
         }
+    }
 
-    #endif
+    if (++s_pkt_cnt % 100 == 0) {
+        ESP_LOGI(BT_AV_TAG, "Audio packet count %"PRIu32", len %"PRIu32", vol 0x%02x, wrote %u",
+                 s_pkt_cnt, len, vol, (unsigned)bytes_written);
+    }
 }
 
 #else
