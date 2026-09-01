@@ -17,6 +17,14 @@
 #define BT_RC_CT_TAG    "RC_CT"
 
 /**
+ * @brief  start paging the devices we were most recently bonded to
+ *
+ * Returns as soon as the first page is sent; the A2DP connection state events
+ * carry the campaign from there. Safe to call with nothing bonded yet.
+ */
+void bt_av_reconnect_start(void);
+
+/**
  * @brief  callback function for A2DP sink
  *
  * @param [in] event  event id

@@ -197,6 +197,10 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
 
         /* set discoverable and connectable mode, wait to be connected */
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+        /* go looking for whoever we were last paired with. we stay connectable
+         * the whole time, so a device that comes to us first still wins */
+        bt_av_reconnect_start();
         break;
     }
     /* others */

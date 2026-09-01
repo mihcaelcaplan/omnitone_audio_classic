@@ -40,9 +40,23 @@
 #define APP_RC_CT_TL_RN_TRACK_CHANGE     (2)
 #define APP_RC_CT_TL_RN_PLAYBACK_CHANGE  (3)
 #define APP_RC_CT_TL_RN_PLAY_POS_CHANGE  (4)
+#define APP_RC_CT_TL_RESUME_PLAY         (5)
 
 /* Application layer causes delay value */
 #define APP_DELAY_VALUE                  50  // 5ms
+
+/* Reconnect campaign: how many of the most recently bonded devices we are
+ * willing to page, and how many pages to send before giving up. Every page that
+ * goes unanswered costs one BT page timeout (~5s by default), so 4 attempts is
+ * roughly 20s of trying -- which is also what paces the retries, see
+ * bt_av_reconnect_page_next(). */
+#define RECONNECT_MAX_PEERS              (2)
+#define RECONNECT_MAX_ATTEMPTS           (4)
+
+/* How close to the disconnect a stream stopping still counts as "the link took
+ * the music with it" rather than "somebody pressed pause". Measured gap is about
+ * 10ms, so this is enormously generous and still nowhere near human timing. */
+#define AUDIO_STOP_GRACE_MS              (2000)
 
 /*******************************
  * STATIC FUNCTION DECLARATIONS
@@ -58,6 +72,10 @@ static void bt_av_playback_changed(void);
 static void bt_av_play_pos_changed(void);
 /* notification event handler */
 static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_parameter);
+/* start a reconnect campaign, optionally resuming playback once it lands */
+static void bt_av_reconnect_begin(bool resume_playback);
+/* page the next device in a reconnect campaign */
+static void bt_av_reconnect_page_next(void);
 /* installation for i2s */
 static void bt_i2s_driver_install(void);
 /* uninstallation for i2s */
@@ -92,10 +110,17 @@ static _lock_t s_volume_lock;
 static TaskHandle_t s_vcs_task_hdl = NULL;    /* handle for volume change simulation task */
 static uint8_t s_volume = 0x40;                 /* local volume value */
 static bool s_volume_notify;                 /* notify volume change or not */
+static esp_bd_addr_t s_reconnect_peers[RECONNECT_MAX_PEERS];
+                                             /* devices to page, most recently connected first */
+static int s_reconnect_peer_count = 0;       /* how many entries of s_reconnect_peers are valid */
+static int s_reconnect_next_peer = 0;        /* which of those the next page targets */
+static int s_reconnect_attempts_left = 0;    /* nonzero while a campaign is in progress */
+static bool s_reconnect_resume_play = false; /* ask the peer to play once we are back */
+static TickType_t s_audio_stopped_at = 0;    /* when the stream last went quiet */
 #ifndef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
 i2s_chan_handle_t tx_chan = NULL;
 #else
-dac_continuous_handle_t tx_chan;
+dac_continuous_handle_t tx_chan = NULL;
 #endif
 
 #if CONFIG_EXAMPLE_AVRCP_CT_COVER_ART_ENABLE
@@ -199,6 +224,11 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
 
 void bt_i2s_driver_install(void)
 {
+    /* called from both the codec config and the connect, whichever gets there
+     * first for a given link, so bringing it up twice must be harmless */
+    if (tx_chan != NULL) {
+        return;
+    }
 #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
     dac_continuous_config_t cont_cfg = {
         .chan_mask = DAC_CHANNEL_MASK_ALL,
@@ -244,9 +274,16 @@ void bt_i2s_driver_install(void)
 
 void bt_i2s_driver_uninstall(void)
 {
+    /* a disconnect can arrive for a link that never opened, so there is not
+     * always a channel to tear down; the calls below are ESP_ERROR_CHECK'd and
+     * would abort the whole device on a NULL handle */
+    if (tx_chan == NULL) {
+        return;
+    }
 #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
     ESP_ERROR_CHECK(dac_continuous_disable(tx_chan));
     ESP_ERROR_CHECK(dac_continuous_del_channels(tx_chan));
+    tx_chan = NULL;
 #else
     ESP_ERROR_CHECK(i2s_channel_disable(tx_chan));
     ESP_ERROR_CHECK(i2s_del_channel(tx_chan));
@@ -292,6 +329,46 @@ static void volume_change_simulation(void *arg)
     }
 }
 
+static void bt_av_reconnect_begin(bool resume_playback)
+{
+    /* Bluedroid keeps the bond list in NVS ordered by most recent ACL, so the
+     * head of this list is the device we were last talking to. Re-reading it at
+     * the top of every campaign means we always page in current recency order. */
+    s_reconnect_peer_count = RECONNECT_MAX_PEERS;
+    esp_err_t err = esp_bt_gap_get_bond_device_list(&s_reconnect_peer_count, s_reconnect_peers);
+    if (err != ESP_OK || s_reconnect_peer_count == 0) {
+        s_reconnect_peer_count = 0;
+        s_reconnect_attempts_left = 0;
+        s_reconnect_resume_play = false;
+        ESP_LOGI(BT_AV_TAG, "reconnect: nothing bonded yet, waiting to be connected");
+        return;
+    }
+
+    ESP_LOGI(BT_AV_TAG, "reconnect: trying the %d most recent device(s)", s_reconnect_peer_count);
+    s_reconnect_next_peer = 0;
+    s_reconnect_attempts_left = RECONNECT_MAX_ATTEMPTS;
+    s_reconnect_resume_play = resume_playback;
+    bt_av_reconnect_page_next();
+}
+
+/* Send one page to the next device in the list. We never wait on this: a page
+ * that goes unanswered comes back as ESP_A2D_CONNECTION_STATE_DISCONNECTED once
+ * the controller's page timeout expires, and that event calls us again. So the
+ * radio itself paces the retries and there is no timer to run. */
+static void bt_av_reconnect_page_next(void)
+{
+    uint8_t *peer = s_reconnect_peers[s_reconnect_next_peer];
+    ESP_LOGI(BT_AV_TAG, "reconnect: paging [%02x:%02x:%02x:%02x:%02x:%02x], %d attempt(s) left",
+             peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], s_reconnect_attempts_left);
+    esp_a2d_sink_connect(peer);
+
+    /* line up the next one, wrapping back to the front of the list */
+    s_reconnect_next_peer++;
+    if (s_reconnect_next_peer >= s_reconnect_peer_count) {
+        s_reconnect_next_peer = 0;
+    }
+}
+
 static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
 {
     ESP_LOGD(BT_AV_TAG, "%s event: %d", __func__, event);
@@ -319,20 +396,59 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
 
             // bt_spi_task_shut_down(); //shut down task
 
+            /* Three different things all arrive here as DISCONNECTED, and only
+             * one of them is somebody's decision:
+             *   - a page we sent went unanswered: keep working through the list.
+             *     disc_rsn is no help here, the failed-open path reports NORMAL
+             *     just like a clean hang-up does, so the campaign counter is
+             *     what tells us there was never a link in the first place
+             *   - a link that was up dropped out: nobody chose that, go get it back
+             *   - somebody hung up on purpose: leave them alone, otherwise the
+             *     speaker would be impossible to walk away from */
+            if (s_reconnect_attempts_left > 0) {
+                /* the page we sent went unanswered; spend the attempt here, where
+                 * the failure actually shows up, so the count stays truthful while
+                 * the last page is still in flight */
+                s_reconnect_attempts_left--;
+                if (s_reconnect_attempts_left > 0) {
+                    bt_av_reconnect_page_next();
+                } else {
+                    ESP_LOGI(BT_AV_TAG, "reconnect: out of attempts, staying connectable");
+                    /* the offer to resume expires with the campaign: if they wander
+                     * back an hour later and the phone reconnects on its own, music
+                     * starting by itself would be a surprise, not a convenience */
+                    s_reconnect_resume_play = false;
+                }
+            } else if (a2d->conn_stat.disc_rsn == ESP_A2D_DISC_RSN_ABNORMAL) {
+                /* A dying link stops the stream on its way out -- bta_av_str_stopped
+                 * reports SUSPEND about 10ms ahead of the disconnect -- so "is audio
+                 * playing right now" is false here no matter what, and cannot be the
+                 * test. What separates the cases is *when* the music stopped: in the
+                 * same breath as the link, or minutes ago because somebody paused. */
+                bool was_playing = (s_audio_state == ESP_A2D_AUDIO_STATE_STARTED) ||
+                                   (xTaskGetTickCount() - s_audio_stopped_at) <
+                                       pdMS_TO_TICKS(AUDIO_STOP_GRACE_MS);
+                ESP_LOGI(BT_AV_TAG, "reconnect: link lost while %s, trying to get it back",
+                         was_playing ? "playing" : "idle");
+                bt_av_reconnect_begin(was_playing);
+            }
 
-        
         } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED){
             esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
+            /* whoever got here, we are done paging; a later dropout starts fresh */
+            s_reconnect_attempts_left = 0;
+
             status_flags |= EXT_MCU_BT_FLAG; //add bt flag globally
-            
+
+            /* i2s comes up here rather than on CONNECTING: a reconnect campaign
+             * leaves several pages unanswered, and installing a driver for a link
+             * that never opens just churns it. AVDTP setup still leaves plenty of
+             * time before the first audio packet lands. */
             // TODO: change i2s to spi and hand over better
+            bt_i2s_driver_install();
             bt_i2s_task_start_up();
             // bt_spi_task_start_up(); // create task
-        
-        } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING) {
-            
-            bt_i2s_driver_install();
         }
         break;
     }
@@ -343,6 +459,10 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
         s_audio_state = a2d->audio_stat.state;
         if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
             s_pkt_cnt = 0;
+        } else {
+            /* note when the music stopped: if a disconnect follows within a breath
+             * of this, the link is what stopped it rather than a person */
+            s_audio_stopped_at = xTaskGetTickCount();
         }
         break;
     }
@@ -367,8 +487,12 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
                 ch_count = 1;
             }
         #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-            dac_continuous_disable(tx_chan);
-            dac_continuous_del_channels(tx_chan);
+            /* same story as the i2s branch below: the channel may not be up yet,
+             * since the driver now comes up at CONNECTED rather than CONNECTING */
+            if (tx_chan != NULL) {
+                dac_continuous_disable(tx_chan);
+                dac_continuous_del_channels(tx_chan);
+            }
             dac_continuous_config_t cont_cfg = {
                 .chan_mask = DAC_CHANNEL_MASK_ALL,
                 .desc_num = 8,
@@ -383,6 +507,12 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             /* Enable the continuous channels */
             dac_continuous_enable(tx_chan);
         #else
+            /* This lands before CONNECTED, where the driver otherwise comes up.
+             * Unlike a connect, this event only fires for a link that is really
+             * negotiating a stream, so no unanswered reconnect page reaches here:
+             * safe to install early, and a no-op if the connect beat us to it. */
+            bt_i2s_driver_install();
+
             /* the channel is taken down here and only comes back at the enable
              * below, so a failure anywhere in between leaves the interface dead
              * with no clocks on the pins -- these returns must not be dropped */
@@ -503,6 +633,16 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
     case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT: {
         ESP_LOGI(BT_RC_CT_TAG, "AVRC passthrough rsp: key_code 0x%x, key_state %d, rsp_code %d", rc->psth_rsp.key_code,
                     rc->psth_rsp.key_state, rc->psth_rsp.rsp_code);
+
+        /* A passthrough key is a press and a release, and our press just came
+         * back answered -- so let go of it now rather than stuffing both halves
+         * onto the wire back to back and hoping the peer keeps up. */
+        if (rc->psth_rsp.tl == APP_RC_CT_TL_RESUME_PLAY &&
+            rc->psth_rsp.key_code == ESP_AVRC_PT_CMD_PLAY &&
+            rc->psth_rsp.key_state == ESP_AVRC_PT_CMD_STATE_PRESSED) {
+            esp_avrc_ct_send_passthrough_cmd(APP_RC_CT_TL_RESUME_PLAY, ESP_AVRC_PT_CMD_PLAY,
+                                             ESP_AVRC_PT_CMD_STATE_RELEASED);
+        }
         break;
     }
     /* when metadata response, this event comes */
@@ -546,6 +686,18 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
         bt_av_new_track();
         bt_av_playback_changed();
         bt_av_play_pos_changed();
+
+        /* We are here because the peer answered our first AVRCP command, which
+         * makes this a better moment to ask for playback than the bare connect
+         * event: the control channel is not just open, it is demonstrably
+         * serving. Same idea as letting the page timeout pace the reconnect --
+         * the protocol tells us when it is ready instead of a timer guessing. */
+        if (s_reconnect_resume_play) {
+            ESP_LOGI(BT_RC_CT_TAG, "reconnect: asking the peer to resume playback");
+            esp_avrc_ct_send_passthrough_cmd(APP_RC_CT_TL_RESUME_PLAY, ESP_AVRC_PT_CMD_PLAY,
+                                             ESP_AVRC_PT_CMD_STATE_PRESSED);
+            s_reconnect_resume_play = false;   /* asked once; do not nag on the next response */
+        }
         break;
     }
     case ESP_AVRC_CT_COVER_ART_STATE_EVT: {
@@ -669,6 +821,13 @@ static void bt_av_hdl_avrc_tg_evt(uint16_t event, void *p_param)
 /********************************
  * EXTERNAL FUNCTION DEFINITIONS
  *******************************/
+
+void bt_av_reconnect_start(void)
+{
+    /* powering on is not a reason to make noise: come back to whoever we were
+     * with, but wait to be asked before playing anything */
+    bt_av_reconnect_begin(false);
+}
 
 void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
