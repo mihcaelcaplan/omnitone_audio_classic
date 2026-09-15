@@ -1,0 +1,36 @@
+# Omnitone partition table - ESP32-PICO-V3-02, 8MB embedded flash
+#
+# Replaces the built-in partitions_singleapp.csv, which assumed 2MB and gave the
+# app exactly 1024K. The binary was already at ~996K, so we had under 30K of
+# headroom and no room at all for audio assets.
+#
+# Name,     Type, SubType,  Offset,   Size,    Flags
+nvs,        data, nvs,      0x9000,   24K,
+phy_init,   data, phy,      0xf000,   4K,
+factory,    app,  factory,  0x10000,  2M,
+audio,      data, spiffs,   ,         2M,
+
+# nvs / phy_init are unchanged from the stock single-app layout on purpose:
+# nvs holds the bonded-device link keys the sticky-reconnect path depends on, so
+# leaving its offset and size alone means an existing unit keeps its pairings
+# across this repartition. Growing nvs would push phy_init off 0xf000 and force
+# factory off the 64K boundary it needs, costing alignment padding for no gain.
+#
+# factory: 2M, roughly double the current binary. App partitions must start on a
+# 0x10000 boundary, so this runs 0x10000..0x210000.
+#
+# audio: 2M of raw flash for the sound bank (index header + concatenated s16le
+# mono PCM). NOT a filesystem - the 'spiffs' subtype is just a value the CSV
+# parser accepts for a data partition; nothing mounts it. Reads go through
+# esp_partition_read() against esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+# ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "audio").
+#
+# 2M is deliberately generous: at 44.1kHz / 16-bit / mono that is ~23 seconds of
+# audio, against maybe 2 seconds of chimes today. Flash is the one thing we now
+# have a surplus of, and oversizing here means adding a sound later never
+# reshuffles offsets.
+#
+# Ends at 0x410000, leaving ~4MB unallocated. That is enough to convert this to
+# dual-slot OTA later without touching the audio partition: factory becomes
+# ota_0, add a matching 2M ota_1 plus an 8K otadata, and the total still fits.
+
