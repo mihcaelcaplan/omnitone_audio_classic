@@ -14,26 +14,11 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "bt_app_core.h"
-#ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-#include "driver/dac_continuous.h"
-#else
-#include "driver/i2s_std.h"
-#endif
-#include "freertos/ringbuf.h"
-
 
 #include "bridge.h"
 
 
 
-#define RINGBUF_HIGHEST_WATER_LEVEL    (32 * 1024)
-#define RINGBUF_PREFETCH_WATER_LEVEL   (20 * 1024)
-
-enum {
-    RINGBUFFER_MODE_PROCESSING,    /* ringbuffer is buffering incoming audio data, I2S is working */
-    RINGBUFFER_MODE_PREFETCHING,   /* ringbuffer is buffering incoming audio data, I2S is waiting */
-    RINGBUFFER_MODE_DROPPING       /* ringbuffer is not buffering (dropping) incoming audio data, I2S is working */
-};
 
 /*******************************
  * STATIC FUNCTION DECLARATIONS
@@ -41,8 +26,6 @@ enum {
 
 /* handler for application task */
 static void bt_app_task_handler(void *arg);
-/* handler for I2S task */
-// static void bt_i2s_task_handler(void *arg);
 /* message sender */
 static bool bt_app_send_msg(bt_app_msg_t *msg);
 /* handle dispatched messages */
@@ -59,12 +42,6 @@ static QueueHandle_t s_bt_app_task_queue = NULL;  /* handle of work queue */
 static TaskHandle_t s_bt_app_task_handle = NULL;  /* handle of application task  */
 static TaskHandle_t s_bt_spi_task_handle = NULL;  /* handle of application task  */
 
-static TaskHandle_t s_bt_i2s_task_handle = NULL;  /* handle of I2S task */
-static RingbufHandle_t s_ringbuf_i2s = NULL;     /* handle of ringbuffer for I2S */
-static SemaphoreHandle_t s_i2s_write_semaphore = NULL;
-static SemaphoreHandle_t s_i2s_task_done = NULL;  /* I2S task acks its own exit */
-static volatile bool s_i2s_task_stop = false;
-static uint16_t ringbuffer_mode = RINGBUFFER_MODE_PROCESSING;
 
 // my queue for spi out
 static QueueHandle_t spi_send_queue = NULL;  /* handle of work queue */
@@ -76,15 +53,6 @@ typedef struct {
     uint32_t len;
 } bridge_data_t;
 
-
-/*********************************
- * EXTERNAL FUNCTION DECLARATIONS
- ********************************/
-#ifndef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-extern i2s_chan_handle_t tx_chan;
-#else
-extern dac_continuous_handle_t tx_chan;
-#endif
 
 /*******************************
  * STATIC FUNCTION DEFINITIONS
@@ -216,56 +184,6 @@ static void bt_spi_task_handler(void* arg){
     }
 }
 
-static void bt_i2s_task_handler(void *arg)
-{
-    uint8_t *data = NULL;
-    size_t item_size = 0;
-    /**
-     * The total length of DMA buffer of I2S is:
-     * `dma_frame_num * dma_desc_num * i2s_channel_num * i2s_data_bit_width / 8`.
-     * Transmit `dma_frame_num * dma_desc_num` bytes to DMA is trade-off.
-     */
-    const size_t item_size_upto = 240 * 6;
-    size_t bytes_written = 0;
-
-    while (!s_i2s_task_stop) {
-        if (pdTRUE == xSemaphoreTake(s_i2s_write_semaphore, portMAX_DELAY)) {
-            while (!s_i2s_task_stop) {
-                item_size = 0;
-                /* receive data from ringbuffer and write it to I2S DMA transmit buffer */
-                data = (uint8_t *)xRingbufferReceiveUpTo(s_ringbuf_i2s, &item_size, (TickType_t)pdMS_TO_TICKS(20), item_size_upto);
-                if (item_size == 0) {
-                    ESP_LOGI(BT_APP_CORE_TAG, "ringbuffer underflowed! mode changed: RINGBUFFER_MODE_PREFETCHING");
-                    ringbuffer_mode = RINGBUFFER_MODE_PREFETCHING;
-                    break;
-                }
-
-                /* snapshot the handle: bt_i2s_driver_uninstall() runs on the app
-                 * task and can null it between this read and the write */
-                if (tx_chan == NULL) {
-                    vRingbufferReturnItem(s_ringbuf_i2s, (void *)data);
-                    break;
-                }
-            #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-                esp_err_t err = dac_continuous_write(tx_chan, data, item_size, &bytes_written, -1);
-            #else
-                esp_err_t err = i2s_channel_write(tx_chan, data, item_size, &bytes_written, portMAX_DELAY);
-            #endif
-                if (err != ESP_OK || bytes_written != item_size) {
-                    ESP_LOGW(BT_APP_CORE_TAG, "i2s write: %s, %u/%u bytes",
-                             esp_err_to_name(err), (unsigned)bytes_written, (unsigned)item_size);
-                }
-                vRingbufferReturnItem(s_ringbuf_i2s, (void *)data);
-            }
-        }
-    }
-
-    /* exit under our own power so we are never killed while holding the I2S
-     * driver's channel mutex, which would wedge the next disable/delete */
-    xSemaphoreGive(s_i2s_task_done);
-    vTaskDelete(NULL);
-}
-
 /********************************
  * EXTERNAL FUNCTION DEFINITIONS
  *******************************/
@@ -349,95 +267,3 @@ void write_spi_queue(uint8_t* data, uint32_t len){
         }
 }
 
-void bt_i2s_task_start_up(void)
-{
-    /* a repeated CONNECTED event would otherwise orphan the previous task,
-     * leaving a second writer on a ringbuffer nobody deletes */
-    if (s_bt_i2s_task_handle) {
-        bt_i2s_task_shut_down();
-    }
-
-    ESP_LOGI(BT_APP_CORE_TAG, "ringbuffer data empty! mode changed: RINGBUFFER_MODE_PREFETCHING");
-    ringbuffer_mode = RINGBUFFER_MODE_PREFETCHING;
-    s_i2s_task_stop = false;
-    if ((s_i2s_task_done = xSemaphoreCreateBinary()) == NULL) {
-        ESP_LOGE(BT_APP_CORE_TAG, "%s, done semaphore create failed", __func__);
-        return;
-    }
-    if ((s_i2s_write_semaphore = xSemaphoreCreateBinary()) == NULL) {
-        ESP_LOGE(BT_APP_CORE_TAG, "%s, Semaphore create failed", __func__);
-        return;
-    }
-    if ((s_ringbuf_i2s = xRingbufferCreate(RINGBUF_HIGHEST_WATER_LEVEL, RINGBUF_TYPE_BYTEBUF)) == NULL) {
-        ESP_LOGE(BT_APP_CORE_TAG, "%s, ringbuffer create failed", __func__);
-        return;
-    }
-    xTaskCreate(bt_i2s_task_handler, "BtI2STask", 2048, NULL, configMAX_PRIORITIES - 3, &s_bt_i2s_task_handle);
-}
-
-void bt_i2s_task_shut_down(void)
-{
-    if (s_bt_i2s_task_handle) {
-        s_i2s_task_stop = true;
-        xSemaphoreGive(s_i2s_write_semaphore);   /* unblock an idle task */
-        if (pdTRUE != xSemaphoreTake(s_i2s_task_done, pdMS_TO_TICKS(500))) {
-            ESP_LOGW(BT_APP_CORE_TAG, "I2S task did not exit, forcing");
-            vTaskDelete(s_bt_i2s_task_handle);
-        }
-        s_bt_i2s_task_handle = NULL;
-    }
-    if (s_i2s_task_done) {
-        vSemaphoreDelete(s_i2s_task_done);
-        s_i2s_task_done = NULL;
-    }
-    if (s_ringbuf_i2s) {
-        vRingbufferDelete(s_ringbuf_i2s);
-        s_ringbuf_i2s = NULL;
-    }
-    if (s_i2s_write_semaphore) {
-        vSemaphoreDelete(s_i2s_write_semaphore);
-        s_i2s_write_semaphore = NULL;
-    }
-}
-
-size_t write_ringbuf(const uint8_t *data, size_t size)
-{
-    size_t item_size = 0;
-    BaseType_t done = pdFALSE;
-
-    /* a disconnect deletes the ringbuffer from the app task while the BT stack
-     * may still be pushing the tail of a stream through this callback */
-    if (s_ringbuf_i2s == NULL) {
-        return 0;
-    }
-
-    if (ringbuffer_mode == RINGBUFFER_MODE_DROPPING) {
-        ESP_LOGW(BT_APP_CORE_TAG, "ringbuffer is full, drop this packet!");
-        vRingbufferGetInfo(s_ringbuf_i2s, NULL, NULL, NULL, NULL, &item_size);
-        if (item_size <= RINGBUF_PREFETCH_WATER_LEVEL) {
-            ESP_LOGI(BT_APP_CORE_TAG, "ringbuffer data decreased! mode changed: RINGBUFFER_MODE_PROCESSING");
-            ringbuffer_mode = RINGBUFFER_MODE_PROCESSING;
-        }
-        return 0;
-    }
-
-    done = xRingbufferSend(s_ringbuf_i2s, (void *)data, size, (TickType_t)0);
-
-    if (!done) {
-        ESP_LOGW(BT_APP_CORE_TAG, "ringbuffer overflowed, ready to decrease data! mode changed: RINGBUFFER_MODE_DROPPING");
-        ringbuffer_mode = RINGBUFFER_MODE_DROPPING;
-    }
-
-    if (ringbuffer_mode == RINGBUFFER_MODE_PREFETCHING) {
-        vRingbufferGetInfo(s_ringbuf_i2s, NULL, NULL, NULL, NULL, &item_size);
-        if (item_size >= RINGBUF_PREFETCH_WATER_LEVEL) {
-            ESP_LOGI(BT_APP_CORE_TAG, "ringbuffer data increased! mode changed: RINGBUFFER_MODE_PROCESSING");
-            ringbuffer_mode = RINGBUFFER_MODE_PROCESSING;
-            if (pdFALSE == xSemaphoreGive(s_i2s_write_semaphore)) {
-                ESP_LOGE(BT_APP_CORE_TAG, "semphore give failed");
-            }
-        }
-    }
-
-    return done ? size : 0;
-}
