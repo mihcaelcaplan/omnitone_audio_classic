@@ -256,6 +256,24 @@ static void verify_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Roll back to the other slot. esp_ota_mark_app_invalid_rollback_and_reboot()
+ * only returns on failure - typically ESP_ERR_OTA_ROLLBACK_FAILED because the
+ * other slot does not validate. Stopping there would leave the state machine
+ * in PENDING_CONFIRM with nothing left to move it: the confirm timer has fired
+ * or been stopped, OTA_ABORT is refused, OTA_BEGIN is refused. So restart
+ * regardless: this image is still PENDING_VERIFY in otadata, the bootloader
+ * marks that ABORTED on the way up and picks the other slot itself, and if
+ * that one really does not boot it falls back to trying every partition -
+ * which lands us back here, no longer pending, with the update reported as
+ * rolled back. Either way the nRF sees a reboot, which is what it expects. */
+static void rollback_and_restart(const char *why)
+{
+    ESP_LOGW(TAG, "%s: rolling back", why);
+    esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    ESP_LOGE(TAG, "rollback failed (%s), restarting and leaving it to the bootloader", esp_err_to_name(err));
+    esp_restart();
+}
+
 static void deferred_cb(void *arg)
 {
     LOCK();
@@ -268,8 +286,7 @@ static void deferred_cb(void *arg)
         esp_restart();
         break;
     case DEFERRED_ROLLBACK:
-        ESP_LOGW(TAG, "rolling back on request");
-        esp_ota_mark_app_invalid_rollback_and_reboot();
+        rollback_and_restart("OTA_ABORT while pending confirm");
         break;
     default:
         break;
@@ -282,8 +299,8 @@ static void confirm_timeout_cb(void *arg)
     bool pending = (s.state == OTA_STATE_PENDING_CONFIRM);
     UNLOCK();
     if (pending) {
-        ESP_LOGE(TAG, "no OTA_CONFIRM within %d s, rolling back", CONFIG_OMNI_OTA_CONFIRM_TIMEOUT_S);
-        esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP_LOGE(TAG, "no OTA_CONFIRM within %d s", CONFIG_OMNI_OTA_CONFIRM_TIMEOUT_S);
+        rollback_and_restart("confirm timeout");
     }
 }
 

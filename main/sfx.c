@@ -107,14 +107,19 @@ esp_err_t sfx_init(void)
     uint32_t used = pcm_start;
     for (int i = 0; i < SFX_COUNT; i++) {
         uint32_t off = s_entries[i].offset;
-        uint32_t bytes = s_entries[i].frames * sizeof(int16_t);
-        if ((off & 1) || off < pcm_start || bytes > s_part->size || off > s_part->size - bytes) {
-            ESP_LOGE(SFX_TAG, "clip %d has a bad extent (offset %"PRIu32", %"PRIu32" bytes)",
-                     i, off, bytes);
+        uint32_t frames = s_entries[i].frames;
+        /* frames is checked before it is doubled: a garbage count with the top
+         * bit set would wrap the byte length small and sail through the extent
+         * test, which is exactly the half-written bank this loop is here for */
+        if ((off & 1) || off < pcm_start || frames > s_part->size / sizeof(int16_t) ||
+            off > s_part->size - frames * sizeof(int16_t)) {
+            ESP_LOGE(SFX_TAG, "clip %d has a bad extent (offset %"PRIu32", %"PRIu32" frames)",
+                     i, off, frames);
             return ESP_ERR_INVALID_STATE;
         }
-        if (off + bytes > used) {
-            used = off + bytes;
+        uint32_t end = off + frames * sizeof(int16_t);
+        if (end > used) {
+            used = end;
         }
     }
 
