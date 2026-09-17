@@ -25,7 +25,12 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 
+#include "audio_out.h"
 #include "bridge.h"
+#include "sfx.h"
+#include "ota_ctl.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 
 
 //parameters :)
@@ -159,6 +164,18 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
     /* when do the stack up, this event comes */
     case BT_APP_EVT_STACK_UP: {
         esp_bt_gap_set_device_name(local_device_name);
+
+        /* Advertise as a loudspeaker. Phones will happily list anything that
+         * answers an inquiry, but macOS hides devices with a generic class, so
+         * without this the Mac never shows us at all. IDF has no constants for
+         * the AV minor classes; 0x05 is Loudspeaker per the assigned numbers. */
+        esp_bt_cod_t cod = {
+            .major = ESP_BT_COD_MAJOR_DEV_AV,
+            .minor = 0x05,
+            .service = ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO,
+        };
+        esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD);
+
         esp_bt_dev_register_callback(bt_app_dev_cb);
         esp_bt_gap_register_callback(bt_app_gap_cb);
 
@@ -201,6 +218,10 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         /* go looking for whoever we were last paired with. we stay connectable
          * the whole time, so a device that comes to us first still wins */
         bt_av_reconnect_start();
+
+        /* the stack is up and every bring-up call that could race a flash
+         * erase is behind us: a firmware update may now take it down */
+        ota_ctl_bt_bringup_done();
         break;
     }
     /* others */
@@ -226,6 +247,18 @@ void app_main(void)
         "|                                                  |\n"
         "+~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=+");
 
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *slot = esp_ota_get_running_partition();
+    ESP_LOGI("OMNI", "firmware %s  built %s %s  idf %s  running from %s @ 0x%lx",
+             app->version, app->date, app->time, app->idf_ver,
+             slot ? slot->label : "?", slot ? (unsigned long)slot->address : 0UL);
+
+    /* Before the SPI task so the first status poll already carries the OTA
+     * bits; before NVS so a pending-confirm boot starts its clock as early as
+     * possible. Only reads otadata, so it does not race the chime's flash rule
+     * further down. */
+    ota_ctl_init();
+
     // start up the spi handler task to be a peripheral to the NRF chip
     err = init_SPI();
     if(err != ESP_OK){
@@ -243,6 +276,22 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    /* Audio output. There is no ordering constraint against the Bluetooth
+     * bringup below: the audio task is the only thing that ever touches I2S,
+     * and the A2DP path reaches it through the same queue the chimes do, so a
+     * phone that reconnects mid-chime just mixes with it rather than racing it
+     * for the peripheral.
+     *
+     * The chime is best-effort - a speaker with no chime still has to work -
+     * but the output itself is not: if the audio task cannot be created there
+     * is no path to the DSP at all, and failing loudly here beats shipping a
+     * silent speaker that looks healthy.
+     *
+     * sfx_init() only validates the bank header and maps it, so it is cheap and
+     * stays here; the chime itself is deliberately fired further down. */
+    ESP_ERROR_CHECK(audio_out_init());
+    bool sfx_ready = (sfx_init() == ESP_OK);
+
     /* TODO: set up the interface address to match the NRF addy*/
 
     /*
@@ -254,11 +303,22 @@ void app_main(void)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if ((err = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
     if ((err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
+    }
+
+    /* Lab bring-up: run the BR/EDR radio at the part's ceiling (+9 dBm) instead
+     * of the ESP_PWR_LVL_N0/P3 default so range problems on the bench are the
+     * antenna's fault and not the controller's. Must come after the controller
+     * is enabled. The floor is left at N0 rather than raised - the controller
+     * still walks power down over a short link, which is what we want. */
+    if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9)) != ESP_OK) {
+        ESP_LOGW(BT_AV_TAG, "%s set tx power failed: %s", __func__, esp_err_to_name(err));
     }
 
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
@@ -267,11 +327,13 @@ void app_main(void)
 #endif
     if ((err = esp_bluedroid_init_with_cfg(&bluedroid_cfg)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s initialize bluedroid failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 
     if ((err = esp_bluedroid_enable()) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable bluedroid failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 
@@ -293,7 +355,25 @@ void app_main(void)
     esp_bt_gap_set_pin(pin_type, 4, pin_code);
 
     ESP_LOGI(BT_AV_TAG, "Own address:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
-    
+
+    /* The power-on chime fires here rather than beside audio_out_init(), and the
+     * placement is load-bearing: everything above writes flash. The controller
+     * enable stores PHY calibration into NVS and bluedroid reads its config out
+     * of it, and on the ESP32 a flash erase takes
+     * spi_flash_disable_interrupts_caches_and_other_cpu() - which suspends both
+     * cores for tens of milliseconds. The audio task cannot run through that (it
+     * can't even fetch its own code with the cache off), so a chime started
+     * before this point plays its attack, drops into a hole while NVS is busy,
+     * and resumes mid-word sounding like a false start.
+     *
+     * Below this line the bringup is RAM-only until a device actually connects,
+     * so the chime still overlaps the stack becoming discoverable and hunting
+     * for its last peer - it delays nothing, it just stops racing the flash. */
+    if (sfx_ready) {
+        // sfx_play(SFX_ON);
+        sfx_play(SFX_STARTUP);
+    }
+
     bt_app_task_start_up(); // start upt the bluetooth work queue handler
     /* bluetooth device name, connection mode and profile set up */
     bt_app_work_dispatch(bt_av_hdl_stack_evt, BT_APP_EVT_STACK_UP, NULL, 0, NULL); // dispatch a work q event-  handled by a callback with this as INIT section

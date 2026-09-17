@@ -7,16 +7,10 @@
 
 uint8_t status_flags = EXT_MCU_ON_FLAG;
 
-// define spi configuration
-#define PIN_NUM_MISO 12
-#define PIN_NUM_MOSI 13
-#define PIN_NUM_CLK  14
-#define PIN_NUM_CS   15
-
 spi_bus_config_t buscfg = {
-    .miso_io_num = PIN_NUM_MISO,
-    .mosi_io_num = PIN_NUM_MOSI,
-    .sclk_io_num = PIN_NUM_CLK,
+    .miso_io_num = BRIDGE_PIN_MISO,
+    .mosi_io_num = BRIDGE_PIN_MOSI,
+    .sclk_io_num = BRIDGE_PIN_CLK,
     .quadwp_io_num = -1,
     .quadhd_io_num = -1,
 };
@@ -26,7 +20,7 @@ size_t max_len = 0;
 //Configuration for the SPI slave interface
     spi_slave_interface_config_t slvcfg = {
         .mode = 0,
-        .spics_io_num = PIN_NUM_CS,
+        .spics_io_num = BRIDGE_PIN_CS,
         .queue_size = 3,
         .flags = 0,
         .post_setup_cb = NULL,

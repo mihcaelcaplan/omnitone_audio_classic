@@ -69,3 +69,22 @@ menu "A2DP Example Configuration"
             If enable, Bluedroid stack will not decode A2DP audio data, user need to decode it in application layer.
 
 endmenu
+
+menu "Omnitone OTA"
+    config OMNI_OTA_CONFIRM_TIMEOUT_S
+        int "Seconds a freshly flashed image waits for OTA_CONFIRM before rolling back"
+        default 90
+        help
+            After OTA_REBOOT the new image runs as PENDING_VERIFY. If the nRF
+            has not sent OTA_CONFIRM by the time this expires, the ESP marks
+            the image invalid and reboots into the previous one.
+
+    config OMNI_OTA_IDLE_TIMEOUT_S
+        int "Seconds of silence from the nRF mid-update before giving up"
+        default 30
+        help
+            While RECEIVING or READY_TO_REBOOT, every OTA command re-arms this.
+            On expiry the update is dropped into ERROR (err = ESP_ERR_TIMEOUT)
+            and Bluetooth comes back on, so an nRF that resets mid-transfer
+            does not leave the speaker silent.
+endmenu

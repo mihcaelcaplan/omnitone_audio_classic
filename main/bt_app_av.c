@@ -13,6 +13,7 @@
 
 #include "bt_app_core.h"
 #include "bt_app_av.h"
+#include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
@@ -23,16 +24,12 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-#include "driver/dac_continuous.h"
-#else
-#include "driver/i2s_std.h"
-#endif
-
 #include "sys/lock.h"
 
 // my drivers
+#include "audio_out.h"
 #include "bridge.h"
+#include "sfx.h"
 
 /* AVRCP used transaction labels */
 #define APP_RC_CT_TL_GET_CAPS            (0)
@@ -76,10 +73,6 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
 static void bt_av_reconnect_begin(bool resume_playback);
 /* page the next device in a reconnect campaign */
 static void bt_av_reconnect_page_next(void);
-/* installation for i2s */
-static void bt_i2s_driver_install(void);
-/* uninstallation for i2s */
-static void bt_i2s_driver_uninstall(void);
 /* set volume by remote controller */
 static void volume_set_by_controller(uint8_t volume);
 /* set volume by local host */
@@ -117,11 +110,7 @@ static int s_reconnect_next_peer = 0;        /* which of those the next page tar
 static int s_reconnect_attempts_left = 0;    /* nonzero while a campaign is in progress */
 static bool s_reconnect_resume_play = false; /* ask the peer to play once we are back */
 static TickType_t s_audio_stopped_at = 0;    /* when the stream last went quiet */
-#ifndef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-i2s_chan_handle_t tx_chan = NULL;
-#else
-dac_continuous_handle_t tx_chan = NULL;
-#endif
+static bool s_ota_hold = false;              /* firmware update in progress: the stack is going down, do not re-page */
 
 #if CONFIG_EXAMPLE_AVRCP_CT_COVER_ART_ENABLE
 static bool cover_art_connected = false;
@@ -222,74 +211,6 @@ static void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *even
     }
 }
 
-void bt_i2s_driver_install(void)
-{
-    /* called from both the codec config and the connect, whichever gets there
-     * first for a given link, so bringing it up twice must be harmless */
-    if (tx_chan != NULL) {
-        return;
-    }
-#ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-    dac_continuous_config_t cont_cfg = {
-        .chan_mask = DAC_CHANNEL_MASK_ALL,
-        .desc_num = 8,
-        .buf_size = 2048,
-        .freq_hz = 44100,
-        .offset = 127,
-        .clk_src = DAC_DIGI_CLK_SRC_DEFAULT,   // Using APLL as clock source to get a wider frequency range
-        .chan_mode = DAC_CHANNEL_MODE_ALTER,
-    };
-    /* Allocate continuous channels */
-    ESP_ERROR_CHECK(dac_continuous_new_channels(&cont_cfg, &tx_chan));
-    /* Enable the continuous channels */
-    ESP_ERROR_CHECK(dac_continuous_enable(tx_chan));
-#else
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100), //TODO: change to 48k or see how ASRC handles
-        // .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO), //TODO: confirm this is wrong
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = CONFIG_EXAMPLE_I2S_BCK_PIN,
-            .ws = CONFIG_EXAMPLE_I2S_LRCK_PIN,
-            .dout = CONFIG_EXAMPLE_I2S_DATA_PIN,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
-    };
-    /* enable I2S */
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
-    ESP_LOGI(BT_AV_TAG, "I2S installed and enabled: bclk %d, ws %d, dout %d",
-             CONFIG_EXAMPLE_I2S_BCK_PIN, CONFIG_EXAMPLE_I2S_LRCK_PIN, CONFIG_EXAMPLE_I2S_DATA_PIN);
-#endif
-}
-
-void bt_i2s_driver_uninstall(void)
-{
-    /* a disconnect can arrive for a link that never opened, so there is not
-     * always a channel to tear down; the calls below are ESP_ERROR_CHECK'd and
-     * would abort the whole device on a NULL handle */
-    if (tx_chan == NULL) {
-        return;
-    }
-#ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-    ESP_ERROR_CHECK(dac_continuous_disable(tx_chan));
-    ESP_ERROR_CHECK(dac_continuous_del_channels(tx_chan));
-    tx_chan = NULL;
-#else
-    ESP_ERROR_CHECK(i2s_channel_disable(tx_chan));
-    ESP_ERROR_CHECK(i2s_del_channel(tx_chan));
-    tx_chan = NULL;
-#endif
-}
 
 static void volume_set_by_controller(uint8_t volume)
 {
@@ -329,6 +250,19 @@ static void volume_change_simulation(void *arg)
     }
 }
 
+/* debug: what a scanner should see for us -- our address and the class of
+ * device the host stack believes it has written to the controller */
+static void bt_av_log_identity(void)
+{
+    const uint8_t *a = esp_bt_dev_get_address();
+    esp_bt_cod_t cod = {0};
+    esp_bt_gap_get_cod(&cod);
+    uint32_t raw = (cod.service << 13) | (cod.major << 8) | (cod.minor << 2) | cod.reserved_2;
+    ESP_LOGI(BT_AV_TAG, "identity: bd_addr [%02x:%02x:%02x:%02x:%02x:%02x] cod 0x%06" PRIx32
+             " (major 0x%02x minor 0x%02x service 0x%03x)",
+             a[0], a[1], a[2], a[3], a[4], a[5], raw, cod.major, cod.minor, cod.service);
+}
+
 static void bt_av_reconnect_begin(bool resume_playback)
 {
     /* Bluedroid keeps the bond list in NVS ordered by most recent ACL, so the
@@ -341,6 +275,7 @@ static void bt_av_reconnect_begin(bool resume_playback)
         s_reconnect_attempts_left = 0;
         s_reconnect_resume_play = false;
         ESP_LOGI(BT_AV_TAG, "reconnect: nothing bonded yet, waiting to be connected");
+        bt_av_log_identity();
         return;
     }
 
@@ -384,17 +319,23 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             s_a2d_conn_state_str[a2d->conn_stat.state], bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
         
             if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-            /* stop the writer before destroying what it writes to: the I2S
-             * task runs unpinned at high priority, so on the other core it can
-             * be entering i2s_channel_write() with a handle this task is about
-             * to i2s_del_channel() -> "this channel is not tx channel" */
-            bt_i2s_task_shut_down();
-            bt_i2s_driver_uninstall();
+            /* The audio task owns the channel and releases it on its own once
+             * both producers go quiet, so there is nothing to tear down here -
+             * just stop being a producer. */
+            audio_out_stream_stop();
             
             status_flags = (status_flags & (~EXT_MCU_BT_FLAG)); // turn off bt flag globally
 
             // bt_spi_task_shut_down(); //shut down task
+
+            /* This disconnect is bt_av_shutdown() pulling the stack out from
+             * under us for a firmware update. Paging again would just fail
+             * against a controller that is on its way down. */
+            if (s_ota_hold) {
+                ESP_LOGI(BT_AV_TAG, "reconnect: not while shutting down for a firmware update");
+                break;
+            }
+            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
             /* Three different things all arrive here as DISCONNECTED, and only
              * one of them is somebody's decision:
@@ -414,6 +355,9 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
                     bt_av_reconnect_page_next();
                 } else {
                     ESP_LOGI(BT_AV_TAG, "reconnect: out of attempts, staying connectable");
+                    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                    bt_av_log_identity();
+
                     /* the offer to resume expires with the campaign: if they wander
                      * back an hour later and the phone reconnects on its own, music
                      * starting by itself would be a surprise, not a convenience */
@@ -441,13 +385,18 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
 
             status_flags |= EXT_MCU_BT_FLAG; //add bt flag globally
 
-            /* i2s comes up here rather than on CONNECTING: a reconnect campaign
-             * leaves several pages unanswered, and installing a driver for a link
-             * that never opens just churns it. AVDTP setup still leaves plenty of
-             * time before the first audio packet lands. */
+            /* Declare the stream open rather than bringing up hardware: the
+             * audio task opens the channel when a producer actually has
+             * something for it. A reconnect campaign that leaves pages
+             * unanswered therefore costs nothing. */
             // TODO: change i2s to spi and hand over better
-            bt_i2s_driver_install();
-            bt_i2s_task_start_up();
+            audio_out_stream_start();
+
+            /* Connect tag. Fire and forget: it queues on the audio task, which
+             * mixes it over the stream once one starts, so it does not matter
+             * that this lands before the codec is configured or that the phone
+             * may begin playing immediately. */
+            sfx_play(SFX_CONNECTED);
             // bt_spi_task_start_up(); // create task
         }
         break;
@@ -486,58 +435,12 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             if (p_mcc->cie.sbc_info.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO) {
                 ch_count = 1;
             }
-        #ifdef CONFIG_EXAMPLE_A2DP_SINK_OUTPUT_INTERNAL_DAC
-            /* same story as the i2s branch below: the channel may not be up yet,
-             * since the driver now comes up at CONNECTED rather than CONNECTING */
-            if (tx_chan != NULL) {
-                dac_continuous_disable(tx_chan);
-                dac_continuous_del_channels(tx_chan);
-            }
-            dac_continuous_config_t cont_cfg = {
-                .chan_mask = DAC_CHANNEL_MASK_ALL,
-                .desc_num = 8,
-                .buf_size = 2048,
-                .freq_hz = sample_rate,
-                .offset = 127,
-                .clk_src = DAC_DIGI_CLK_SRC_DEFAULT,   // Using APLL as clock source to get a wider frequency range
-                .chan_mode = (ch_count == 1) ? DAC_CHANNEL_MODE_SIMUL : DAC_CHANNEL_MODE_ALTER,
-            };
-            /* Allocate continuous channels */
-            dac_continuous_new_channels(&cont_cfg, &tx_chan);
-            /* Enable the continuous channels */
-            dac_continuous_enable(tx_chan);
-        #else
-            /* This lands before CONNECTED, where the driver otherwise comes up.
-             * Unlike a connect, this event only fires for a link that is really
-             * negotiating a stream, so no unanswered reconnect page reaches here:
-             * safe to install early, and a no-op if the connect beat us to it. */
-            bt_i2s_driver_install();
+            /* Hand the format to the audio task rather than touching the
+             * peripheral here. It applies the change between mix chunks, so it
+             * can never land mid-write, and a chime that happens to be playing
+             * is retuned to the new rate instead of being cut off. */
+            audio_out_set_format((uint32_t)sample_rate, (uint8_t)ch_count);
 
-            /* the channel is taken down here and only comes back at the enable
-             * below, so a failure anywhere in between leaves the interface dead
-             * with no clocks on the pins -- these returns must not be dropped */
-            if (tx_chan == NULL) {
-                ESP_LOGE(BT_AV_TAG, "audio cfg arrived with no I2S channel installed");
-            } else {
-                esp_err_t cfg_err;
-                i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
-                i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, ch_count);
-                if ((cfg_err = i2s_channel_disable(tx_chan)) != ESP_OK) {
-                    ESP_LOGE(BT_AV_TAG, "i2s_channel_disable: %s", esp_err_to_name(cfg_err));
-                }
-                if ((cfg_err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg)) != ESP_OK) {
-                    ESP_LOGE(BT_AV_TAG, "i2s_channel_reconfig_std_clock: %s", esp_err_to_name(cfg_err));
-                }
-                if ((cfg_err = i2s_channel_reconfig_std_slot(tx_chan, &slot_cfg)) != ESP_OK) {
-                    ESP_LOGE(BT_AV_TAG, "i2s_channel_reconfig_std_slot: %s", esp_err_to_name(cfg_err));
-                }
-                if ((cfg_err = i2s_channel_enable(tx_chan)) != ESP_OK) {
-                    ESP_LOGE(BT_AV_TAG, "i2s_channel_enable: %s", esp_err_to_name(cfg_err));
-                } else {
-                    ESP_LOGI(BT_AV_TAG, "I2S re-enabled: %d Hz, %d ch", sample_rate, ch_count);
-                }
-            }
-        #endif
             ESP_LOGI(BT_AV_TAG, "Configure audio player: 0x%x-0x%x-0x%x-0x%x-0x%x-%d-%d",
                      p_mcc->cie.sbc_info.samp_freq,
                      p_mcc->cie.sbc_info.ch_mode,
@@ -829,6 +732,21 @@ void bt_av_reconnect_start(void)
     bt_av_reconnect_begin(false);
 }
 
+void bt_av_shutdown(void)
+{
+    /* Called from the OTA erase task. One way: nothing here comes back short
+     * of a reset, and ota_ctl resets on every exit from an update, successful
+     * or not. Both disables block until the stack has actually stopped, so on
+     * return there is no controller left to miss a slot while the flash is
+     * being erased under it. */
+    ESP_LOGI(BT_AV_TAG, "firmware update: shutting Bluetooth down");
+    s_ota_hold = true;
+    s_reconnect_attempts_left = 0;
+    s_reconnect_resume_play = false;
+    esp_bluedroid_disable();
+    esp_bt_controller_disable();
+}
+
 void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     switch (event) {
@@ -853,14 +771,14 @@ void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 
 /*
  * Decoded PCM arrives here on the BTC task. This is the single fan-out point
- * for the stream: today it goes straight out I2S to the DSP. Later this
- * selects between the I2S sink and write_spi_queue() (raw PCM to the nRF for
- * rebroadcast) -- the SPI bridge task runs alongside as a status machine and
- * must never contend for this data. Not built yet.
+ * for the stream: today it goes to the audio task, which mixes it with any
+ * sound effect and owns the write to the DSP. Later this also selects
+ * write_spi_queue() (raw PCM to the nRF for rebroadcast) -- the SPI bridge task
+ * runs alongside as a status machine and must never contend for this data.
  *
- * Note this writes I2S inline, so a DMA stall blocks the Bluetooth stack.
- * bt_i2s_task_handler() + write_ringbuf() in bt_app_core.c are the decoupled
- * path if that becomes a problem; they are left in place but unused.
+ * This used to call i2s_channel_write() inline, which meant a DMA stall blocked
+ * the Bluetooth stack. Handing off to a ringbuffer decouples the two, at the
+ * cost of the prefetch latency audio_out.c documents.
  */
 void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
@@ -876,18 +794,10 @@ void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
         }
     }
 
-    size_t bytes_written = 0;
-    /* uninstall runs on the app task and nulls this on disconnect */
-    if (tx_chan != NULL) {
-        esp_err_t err = i2s_channel_write(tx_chan, data, len, &bytes_written, portMAX_DELAY);
-        if (err != ESP_OK || bytes_written != len) {
-            ESP_LOGW(BT_AV_TAG, "i2s write: %s, %u/%"PRIu32" bytes",
-                     esp_err_to_name(err), (unsigned)bytes_written, len);
-        }
-    }
+    size_t bytes_written = audio_out_stream_write(data, len);
 
     if (++s_pkt_cnt % 100 == 0) {
-        ESP_LOGI(BT_AV_TAG, "Audio packet count %"PRIu32", len %"PRIu32", vol 0x%02x, wrote %u",
+        ESP_LOGI(BT_AV_TAG, "Audio packet count %"PRIu32", len %"PRIu32", vol 0x%02x, queued %u",
                  s_pkt_cnt, len, vol, (unsigned)bytes_written);
     }
 }

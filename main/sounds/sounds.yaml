@@ -1,0 +1,45 @@
+# The sound bank: which clips exist, which wav each one is, and how loud to
+# pack it. Read by ./pack_sounds.py - run it after editing this file, then
+# commit sfx_bank.bin and sfx_ids.h alongside the change.
+#
+# Each key under `sounds:` becomes an sfx_id_t enumerator: `power_on` ->
+# SFX_POWER_ON. The wav defaults to <name>.wav, so `file:` is only needed when
+# the two differ - which is how you give a clip a name that says what it is
+# for rather than what the artist called it.
+#
+# Level is baked into the samples at pack time, not applied at playback, so the
+# firmware and the bank format are untouched by any of this:
+#
+#   peak_db   normalise the clip's loudest sample to this dBFS. The knob you
+#             want for "make everything sit at the same level".
+#   gain_db   flat trim, applied after peak_db. Use on its own to nudge a clip
+#             you are happy with, or on top of peak_db to sit one clip above or
+#             below the rest.
+#
+# Chimes get mixed against live music, so leave headroom: -6dBFS is a sane
+# house level and the packer warns if anything ends up clipping or near-silent.
+# Note that audio_out.c applies a further -6dB (SFX_GAIN_Q12) to everything at
+# playback, so these numbers are relative to each other, not to the music.
+
+defaults:
+  peak_db: -8.0
+
+sounds:
+  # Power-on chime. Currently a synthesised placeholder - a 220ms sine glide
+  # from 500Hz to 1kHz.
+  "on":
+    file: on.wav
+
+  goodkush:
+    file: goodkush.wav
+
+  trapaholics:
+    file: trapaholics.wav
+    gain_db: -3.0
+
+  startup: 
+    file: "startup.wav"
+
+  connected: 
+    file: "connected.wav"
+

@@ -25,6 +25,17 @@
 void bt_av_reconnect_start(void);
 
 /**
+ * @brief  shut Bluetooth down for a firmware update
+ *
+ * Disables bluedroid and then the controller, dropping any link or page in
+ * flight, and blocks until both have stopped. There is no matching bring-up:
+ * the only way back is a reset, which is what ota_ctl does on every exit from
+ * an update. Call from a task that can afford to block for a while, not the
+ * SPI task.
+ */
+void bt_av_shutdown(void);
+
+/**
  * @brief  callback function for A2DP sink
  *
  * @param [in] event  event id
