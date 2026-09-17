@@ -19,6 +19,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -47,3 +48,9 @@ size_t audio_out_stream_write(const uint8_t *pcm, size_t len);
  * is safe from any task and any callback context. Prefer sfx_play() in sfx.h,
  * which is this plus the type-checked id. */
 esp_err_t audio_out_play_sfx(int clip_id);
+
+/* Is the I2S channel up - streaming, chiming, paused, or inside the linger?
+ * A snapshot for anyone about to do something that would stall the DMA (a
+ * flash erase: see flog.c). It can go stale the moment it returns, so it is a
+ * hint to hold off, not a lock. */
+bool audio_out_is_active(void);

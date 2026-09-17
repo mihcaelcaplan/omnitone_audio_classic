@@ -88,3 +88,34 @@ menu "Omnitone OTA"
             and Bluetooth comes back on, so an nRF that resets mid-transfer
             does not leave the speaker silent.
 endmenu
+
+menu "Omnitone flash log"
+    config OMNI_FLOG_RAM_KB
+        int "KB of DRAM buffering log lines ahead of the flash"
+        default 12
+        help
+            Every ESP_LOG line lands here first; a low-priority task drains it
+            to the 'log' partition. It has to hold the whole boot log (flash
+            is untouchable until Bluetooth bring-up is over) and whatever is
+            logged while audio is playing and no pre-erased sector is left.
+            When it overflows the oldest lines are dropped and a marker line
+            says how much went missing.
+
+    config OMNI_FLOG_FLUSH_MS
+        int "Longest a logged line waits in RAM before it is written"
+        default 1000
+        help
+            Bounds what a crash or power loss can take with it. Lines are
+            also written as soon as a page's worth (256 bytes) is pending.
+
+    config OMNI_FLOG_ERASE_AHEAD
+        int "Sectors kept erased ahead of the write point"
+        default 2
+        range 1 8
+        help
+            A 4K erase stalls both cores for longer than the I2S DMA can
+            cover, so flog only erases while the output is idle and keeps this
+            many sectors ready for the next stretch of playback. Each one is
+            ~4K of log that can be written mid-stream before lines start
+            piling up in RAM.
+endmenu

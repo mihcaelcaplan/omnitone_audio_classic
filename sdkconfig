@@ -455,6 +455,14 @@ CONFIG_OMNI_OTA_IDLE_TIMEOUT_S=30
 # end of Omnitone OTA
 
 #
+# Omnitone flash log
+#
+CONFIG_OMNI_FLOG_RAM_KB=12
+CONFIG_OMNI_FLOG_FLUSH_MS=1000
+CONFIG_OMNI_FLOG_ERASE_AHEAD=2
+# end of Omnitone flash log
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

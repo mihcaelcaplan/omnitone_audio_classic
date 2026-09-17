@@ -21,6 +21,7 @@
 #include "esp_app_desc.h"
 #include "bridge.h"
 #include "ota_ctl.h"
+#include "flog.h"
 
 
 
@@ -139,6 +140,8 @@ static bool frame_shape_ok(const uint8_t *rx, size_t rx_len)
         uint16_t len = rd16(&rx[3]);
         return len <= MAX_SPI_TRANSFER_CHUNK && rx_len == BRIDGE_OTA_DATA_FRAME_LEN(len);
     }
+    case BRIDGE_CMD_LOG_READ:
+        return rx_len == BRIDGE_LOG_READ_LEN;
     default:
         // STATUS, VERSION, the payload-less OTA_* commands, and anything we
         // don't know (which still gets an UNKNOWN_CMD reply if well formed)
@@ -297,6 +300,38 @@ static void bt_spi_task_handler(void* arg){
 
             case BRIDGE_CMD_OTA_ABORT: {
                 uint8_t res = ota_ctl_abort();
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
+            }
+
+            case BRIDGE_CMD_LOG_INFO: {
+                flog_info_t info = { 0 };
+                uint8_t res = flog_info(&info);
+                uint8_t reply[11] = {
+                    res,
+                    (uint8_t)info.oldest, (uint8_t)(info.oldest >> 8), (uint8_t)(info.oldest >> 16), (uint8_t)(info.oldest >> 24),
+                    (uint8_t)info.end,    (uint8_t)(info.end >> 8),    (uint8_t)(info.end >> 16),    (uint8_t)(info.end >> 24),
+                    (uint8_t)info.pending, (uint8_t)(info.pending >> 8),
+                };
+                bridge_reply(tx_buf, incoming_command, reply, sizeof(reply));
+                break;
+            }
+
+            case BRIDGE_CMD_LOG_READ: {
+                // [cmd][offset u32][len u16] -> [tag][result][len u16][data].
+                // The data goes straight into tx_buf; the SPI DMA reads it
+                // from there on the master's next NONE frame.
+                uint32_t offset = rd32(&rx_buf[1]);
+                uint16_t want = rd16(&rx_buf[5]);
+                uint16_t got = 0;
+                uint8_t res = flog_read(offset, &tx_buf[4], want, &got);
+                uint8_t hdr[3] = { res, (uint8_t)got, (uint8_t)(got >> 8) };
+                bridge_reply(tx_buf, incoming_command, hdr, sizeof(hdr));
+                break;
+            }
+
+            case BRIDGE_CMD_LOG_CLEAR: {
+                uint8_t res = flog_clear();
                 bridge_reply(tx_buf, incoming_command, &res, 1);
                 break;
             }

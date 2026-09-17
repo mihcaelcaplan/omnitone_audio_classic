@@ -11,6 +11,8 @@ ota_0,      app,  ota_0,    0x10000,  2M,
 audio,      data, spiffs,   0x210000, 2M,
 otadata,    data, ota,      0x410000, 8K,
 ota_1,      app,  ota_1,    0x420000, 2M,
+log,        0x40, 0x00,     0x620000, 1M,
+coredump,   data, coredump, 0x720000, 64K,
 
 # nvs / phy_init are unchanged from the stock single-app layout on purpose:
 # nvs holds the bonded-device link keys the sticky-reconnect path depends on, so
@@ -38,4 +40,14 @@ ota_1,      app,  ota_1,    0x420000, 2M,
 # it lands after audio. App slots must start on a 0x10000 boundary, so ota_1
 # starts at 0x420000 rather than immediately after the 8K otadata.
 #
-# Ends at 0x620000, leaving ~1.9MB unallocated.
+# log: 1M of raw flash for the runtime log (flog.c), a ring of 4K sectors that
+# the nRF pulls over the bridge with LOG_INFO / LOG_READ. Like audio it is NOT
+# a filesystem - a filesystem would erase sectors on its own schedule, and on
+# the ESP32 an erase stalls both cores long enough to punch a hole in the
+# audio. flog only erases when the output is idle. Type 0x40 is the first
+# user-defined type; the audio partition predates that convention.
+#
+# coredump: reserved now so enabling CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH later
+# is an sdkconfig change and not another serial reflash. Nothing writes it yet.
+#
+# Ends at 0x730000, leaving 832K unallocated.

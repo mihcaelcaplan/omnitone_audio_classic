@@ -29,6 +29,7 @@
 #include "bridge.h"
 #include "sfx.h"
 #include "ota_ctl.h"
+#include "flog.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 
@@ -55,6 +56,14 @@ static void bt_app_dev_cb(esp_bt_dev_cb_event_t event, esp_bt_dev_cb_param_t *pa
 static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
 /* handler for bluetooth stack enabled events */
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
+
+/* Bluetooth bring-up is over, one way or the other: every call that could
+ * race a flash erase is behind us. Both flash users wait on this. */
+static void bt_bringup_done(void)
+{
+    ota_ctl_bt_bringup_done();
+    flog_flash_ready();
+}
 
 /*******************************
  * STATIC FUNCTION DEFINITIONS
@@ -220,8 +229,9 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         bt_av_reconnect_start();
 
         /* the stack is up and every bring-up call that could race a flash
-         * erase is behind us: a firmware update may now take it down */
-        ota_ctl_bt_bringup_done();
+         * erase is behind us: a firmware update may now take it down, and
+         * the log can start landing on flash */
+        bt_bringup_done();
         break;
     }
     /* others */
@@ -238,6 +248,10 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
 void app_main(void)
 {
     esp_err_t err;
+
+    /* First, so the banner below and everything after it is captured. Only
+     * reads flash here; writes wait for bt_bringup_done(). */
+    flog_init();
 
     ESP_LOGI("OMNI","\n"
         "+~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=+\n"
@@ -303,12 +317,12 @@ void app_main(void)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if ((err = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(err));
-        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
+        bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
     if ((err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(err));
-        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
+        bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 
@@ -327,13 +341,13 @@ void app_main(void)
 #endif
     if ((err = esp_bluedroid_init_with_cfg(&bluedroid_cfg)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s initialize bluedroid failed: %s", __func__, esp_err_to_name(err));
-        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
+        bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 
     if ((err = esp_bluedroid_enable()) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable bluedroid failed: %s", __func__, esp_err_to_name(err));
-        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
+        bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 

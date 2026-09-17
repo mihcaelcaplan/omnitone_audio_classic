@@ -9,6 +9,7 @@
 // answer one transaction late (see bt_spi_task_handler in bt_app_core.c).
 
 #define MAX_SPI_TRANSFER_CHUNK 2048 // largest OTA_DATA payload
+#define MAX_LOG_READ_CHUNK     2048 // largest LOG_READ reply payload; [tag][result][len u16] ahead of it fits BRIDGE_FRAME_MAX
 
 // Frame layout. The master pads every frame to a multiple of 4 bytes because
 // the ESP32 slave DMA only lands whole words in rx_buf.
@@ -17,6 +18,7 @@
 #define BRIDGE_OTA_BEGIN_LEN     8  // [cmd][size u32] + 3 pad
 #define BRIDGE_OTA_DATA_HDR_LEN  5  // [cmd][seq u16][len u16] ahead of the payload
 #define BRIDGE_OTA_DATA_CRC_LEN  4  // crc32 after the payload
+#define BRIDGE_LOG_READ_LEN      8  // [cmd][offset u32][len u16] + 1 pad
 #define BRIDGE_ROUND_UP(n, m)    ((((n) + (m) - 1) / (m)) * (m))
 // what the master clocks for an OTA_DATA frame carrying len payload bytes
 #define BRIDGE_OTA_DATA_FRAME_LEN(len) \
@@ -39,6 +41,7 @@
 
 // status_flags bits, read via BRIDGE_CMD_STATUS
 #define EXT_MCU_ON_FLAG          (0x01 << 7)
+#define EXT_MCU_LOG_CRASH_FLAG   (0x01 << 5) // this boot followed a panic / watchdog / brownout; pull the log. Cleared by a LOG_READ that reaches 'end', or LOG_CLEAR
 #define EXT_MCU_OTA_ERROR_FLAG   (0x01 << 4) // last OTA attempt failed or was rolled back; details via OTA_STATE
 #define EXT_MCU_OTA_PENDING_FLAG (0x01 << 3) // new image booted, waiting for OTA_CONFIRM
 #define EXT_MCU_OTA_BUSY_FLAG    (0x01 << 2) // erase / receive / verify in progress, BT is quiesced
@@ -58,6 +61,13 @@ typedef enum {
     BRIDGE_CMD_OTA_REBOOT  = 0x24, //                                             -> [0xA4][result], restart follows ~500ms later
     BRIDGE_CMD_OTA_CONFIRM = 0x25, //                                             -> [0xA5][result]
     BRIDGE_CMD_OTA_ABORT   = 0x26, //                                             -> [0xA6][result]
+    // Runtime log (flog.h). The log is one byte stream addressed by a u32
+    // offset that only grows; LOG_INFO says which range is on flash, LOG_READ
+    // returns a slice of it. Reads never cross a 4080-byte sector, so a reply
+    // can be shorter than asked; keep reading until len comes back 0.
+    BRIDGE_CMD_LOG_INFO    = 0x30, //                                             -> [0xB0][result][oldest u32][end u32][pending u16]
+    BRIDGE_CMD_LOG_READ    = 0x31, // [offset u32][len u16 <= 2048]               -> [0xB1][result][len u16][data]
+    BRIDGE_CMD_LOG_CLEAR   = 0x32, //                                             -> [0xB2][result]
 } bridge_cmd_t;
 
 #define BRIDGE_REPLY_TAG 0x80

@@ -796,8 +796,11 @@ void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 
     size_t bytes_written = audio_out_stream_write(data, len);
 
+    /* Debug only: at INFO this line every ~2 s would be the single biggest
+     * consumer of the flash log (flog.c) over a long stream, and it says
+     * nothing a working speaker needs said. */
     if (++s_pkt_cnt % 100 == 0) {
-        ESP_LOGI(BT_AV_TAG, "Audio packet count %"PRIu32", len %"PRIu32", vol 0x%02x, queued %u",
+        ESP_LOGD(BT_AV_TAG, "Audio packet count %"PRIu32", len %"PRIu32", vol 0x%02x, queued %u",
                  s_pkt_cnt, len, vol, (unsigned)bytes_written);
     }
 }

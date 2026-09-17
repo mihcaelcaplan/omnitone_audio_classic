@@ -508,6 +508,12 @@ void audio_out_set_format(uint32_t sample_rate, uint8_t channels)
     ctl_post(CTL_SET_FORMAT, sample_rate, channels, 0);
 }
 
+bool audio_out_is_active(void)
+{
+    /* Written only by the audio task; a pointer read is atomic here. */
+    return s_chan != NULL;
+}
+
 esp_err_t audio_out_play_sfx(int clip_id)
 {
     if (s_ctl_q == NULL) {
