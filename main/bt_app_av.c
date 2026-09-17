@@ -13,6 +13,7 @@
 
 #include "bt_app_core.h"
 #include "bt_app_av.h"
+#include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
@@ -47,7 +48,7 @@
  * roughly 20s of trying -- which is also what paces the retries, see
  * bt_av_reconnect_page_next(). */
 #define RECONNECT_MAX_PEERS              (2)
-#define RECONNECT_MAX_ATTEMPTS           (4)
+#define RECONNECT_MAX_ATTEMPTS           (1)
 
 /* How close to the disconnect a stream stopping still counts as "the link took
  * the music with it" rather than "somebody pressed pause". Measured gap is about
@@ -109,6 +110,7 @@ static int s_reconnect_next_peer = 0;        /* which of those the next page tar
 static int s_reconnect_attempts_left = 0;    /* nonzero while a campaign is in progress */
 static bool s_reconnect_resume_play = false; /* ask the peer to play once we are back */
 static TickType_t s_audio_stopped_at = 0;    /* when the stream last went quiet */
+static bool s_ota_hold = false;              /* firmware update in progress: the stack is going down, do not re-page */
 
 #if CONFIG_EXAMPLE_AVRCP_CT_COVER_ART_ENABLE
 static bool cover_art_connected = false;
@@ -248,6 +250,19 @@ static void volume_change_simulation(void *arg)
     }
 }
 
+/* debug: what a scanner should see for us -- our address and the class of
+ * device the host stack believes it has written to the controller */
+static void bt_av_log_identity(void)
+{
+    const uint8_t *a = esp_bt_dev_get_address();
+    esp_bt_cod_t cod = {0};
+    esp_bt_gap_get_cod(&cod);
+    uint32_t raw = (cod.service << 13) | (cod.major << 8) | (cod.minor << 2) | cod.reserved_2;
+    ESP_LOGI(BT_AV_TAG, "identity: bd_addr [%02x:%02x:%02x:%02x:%02x:%02x] cod 0x%06" PRIx32
+             " (major 0x%02x minor 0x%02x service 0x%03x)",
+             a[0], a[1], a[2], a[3], a[4], a[5], raw, cod.major, cod.minor, cod.service);
+}
+
 static void bt_av_reconnect_begin(bool resume_playback)
 {
     /* Bluedroid keeps the bond list in NVS ordered by most recent ACL, so the
@@ -260,6 +275,7 @@ static void bt_av_reconnect_begin(bool resume_playback)
         s_reconnect_attempts_left = 0;
         s_reconnect_resume_play = false;
         ESP_LOGI(BT_AV_TAG, "reconnect: nothing bonded yet, waiting to be connected");
+        bt_av_log_identity();
         return;
     }
 
@@ -303,7 +319,6 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             s_a2d_conn_state_str[a2d->conn_stat.state], bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
         
             if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
             /* The audio task owns the channel and releases it on its own once
              * both producers go quiet, so there is nothing to tear down here -
              * just stop being a producer. */
@@ -312,6 +327,15 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
             status_flags = (status_flags & (~EXT_MCU_BT_FLAG)); // turn off bt flag globally
 
             // bt_spi_task_shut_down(); //shut down task
+
+            /* This disconnect is bt_av_shutdown() pulling the stack out from
+             * under us for a firmware update. Paging again would just fail
+             * against a controller that is on its way down. */
+            if (s_ota_hold) {
+                ESP_LOGI(BT_AV_TAG, "reconnect: not while shutting down for a firmware update");
+                break;
+            }
+            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
             /* Three different things all arrive here as DISCONNECTED, and only
              * one of them is somebody's decision:
@@ -332,6 +356,7 @@ static void bt_av_hdl_a2d_evt(uint16_t event, void *p_param)
                 } else {
                     ESP_LOGI(BT_AV_TAG, "reconnect: out of attempts, staying connectable");
                     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                    bt_av_log_identity();
 
                     /* the offer to resume expires with the campaign: if they wander
                      * back an hour later and the phone reconnects on its own, music
@@ -705,6 +730,21 @@ void bt_av_reconnect_start(void)
     /* powering on is not a reason to make noise: come back to whoever we were
      * with, but wait to be asked before playing anything */
     bt_av_reconnect_begin(false);
+}
+
+void bt_av_shutdown(void)
+{
+    /* Called from the OTA erase task. One way: nothing here comes back short
+     * of a reset, and ota_ctl resets on every exit from an update, successful
+     * or not. Both disables block until the stack has actually stopped, so on
+     * return there is no controller left to miss a slot while the flash is
+     * being erased under it. */
+    ESP_LOGI(BT_AV_TAG, "firmware update: shutting Bluetooth down");
+    s_ota_hold = true;
+    s_reconnect_attempts_left = 0;
+    s_reconnect_resume_play = false;
+    esp_bluedroid_disable();
+    esp_bt_controller_disable();
 }
 
 void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)

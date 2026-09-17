@@ -13,9 +13,14 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "driver/gpio.h"
 #include "bt_app_core.h"
 
+#include "esp_app_desc.h"
 #include "bridge.h"
+#include "ota_ctl.h"
 
 
 
@@ -104,33 +109,92 @@ static void bt_app_task_handler(void *arg)
     }
 }
 
+/* Little-endian field helpers for frames from the master */
+static inline uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+/* Stage a reply for the next transaction: [cmd | tag][payload...] */
+static void bridge_reply(uint8_t *tx, uint8_t cmd, const void *payload, size_t len)
+{
+    tx[0] = cmd | BRIDGE_REPLY_TAG;
+    if (len) {
+        memcpy(&tx[1], payload, len);
+    }
+}
+
+/* Is this the exact frame the master sends for cmd? Anything else is the
+ * tail of a frame we armed for too late (see wait_cs_idle) and must not be
+ * acted on: an image byte in rx[0] looks just like a command. */
+static bool frame_shape_ok(const uint8_t *rx, size_t rx_len)
+{
+    switch (rx[0]) {
+    case BRIDGE_CMD_NONE:
+        return true;
+    case BRIDGE_CMD_OTA_BEGIN:
+        return rx_len == BRIDGE_OTA_BEGIN_LEN;
+    case BRIDGE_CMD_OTA_DATA: {
+        if (rx_len < BRIDGE_OTA_DATA_HDR_LEN) {
+            return false;
+        }
+        uint16_t len = rd16(&rx[3]);
+        return len <= MAX_SPI_TRANSFER_CHUNK && rx_len == BRIDGE_OTA_DATA_FRAME_LEN(len);
+    }
+    default:
+        // STATUS, VERSION, the payload-less OTA_* commands, and anything we
+        // don't know (which still gets an UNKNOWN_CMD reply if well formed)
+        return rx_len == BRIDGE_CMD_ONLY_LEN;
+    }
+}
+
+/* Don't arm the slave while the master is mid-frame. A transaction queued
+ * with CS already low captures the tail of that frame, and whatever image
+ * byte lands in rx[0] is decoded as a command - a payload 0x26 has aborted a
+ * live update this way. The in-flight frame is lost either way; the master
+ * notices the missing ack and resyncs on OTA_STATE. Bounded so a stuck CS
+ * can't hang the bridge. */
+#define CS_IDLE_WAIT_US 5000
+
+static void wait_cs_idle(void)
+{
+    int64_t deadline = esp_timer_get_time() + CS_IDLE_WAIT_US;
+    while (gpio_get_level(BRIDGE_PIN_CS) == 0 && esp_timer_get_time() < deadline) {
+        esp_rom_delay_us(20);
+    }
+}
+
 static void bt_spi_task_handler(void* arg){
 
     esp_err_t err = 0;
 
-    // ESP32 DMA writes in full words regardless of the declared bit length,
-    // so a <4 byte allocation would let the DMA HW overwrite adjacent heap memory
-    uint8_t *rx_buf = heap_caps_malloc(4, MALLOC_CAP_DMA);
-    uint8_t *tx_buf = heap_caps_malloc(4, MALLOC_CAP_DMA);
-    tx_buf[0] = 0x00;
-    tx_buf[1] = 0x00;
+    // Both buffers are the full frame size: rx because OTA_DATA is that big,
+    // tx because the DMA clocks .length bits out of it regardless of how short
+    // the reply is. ESP32 slave DMA also works in whole words, so the master
+    // pads every frame to a multiple of 4 bytes.
+    uint8_t *rx_buf = heap_caps_calloc(1, BRIDGE_FRAME_MAX, MALLOC_CAP_DMA);
+    uint8_t *tx_buf = heap_caps_calloc(1, BRIDGE_FRAME_MAX, MALLOC_CAP_DMA);
+    assert(rx_buf != NULL && tx_buf != NULL);
 
-    // Single 2-byte full-duplex exchange per poll instead of two separate
-    // command/response transactions: the master leaves only ~12us between
-    // back-to-back transceive() calls, which isn't enough time for this task
-    // to wake, decode, and requeue a live response (measured on a capture -
-    // response always came back 0x00 0x00). Responding one poll late removes
-    // the race entirely: tx_buf is prepared here with ~100ms of slack before
-    // the *next* transaction clocks it out, instead of ~12us.
+    // Every command is answered one transaction late: the master leaves only
+    // ~12us between back-to-back transceive() calls, which isn't enough time
+    // for this task to wake, decode, and requeue a live response (measured on
+    // a capture - response always came back 0x00 0x00). Preparing tx_buf here
+    // and letting the *next* transaction clock it out removes the race.
+    //
+    // The flip side is that a frame the master sends while we are still busy
+    // with the previous one (or while a flash erase has the cache off) is
+    // simply lost - no transaction is queued to receive it. The OTA protocol
+    // is stop-and-wait with sequence numbers for exactly that reason: the
+    // master polls OTA_STATE until next_seq moves, and resends if it doesn't.
     spi_slave_transaction_t *done_trans = NULL;
     spi_slave_transaction_t txn = {
-        .length = 16,
+        .length = BRIDGE_FRAME_MAX * 8,
         .tx_buffer = tx_buf,
         .rx_buffer = rx_buf,
     };
 
     for (;;){ /* loop here forever because task*/
 
+        wait_cs_idle();
         err = spi_slave_queue_trans(BRIDGE_DEV, &txn, portMAX_DELAY);
         if (err != ESP_OK) {
             ESP_LOGE("OMNI", "spi_slave_queue_trans failed: %d", err);
@@ -143,25 +207,105 @@ static void bt_spi_task_handler(void* arg){
             continue;
         }
 
+        size_t rx_bits = done_trans->trans_len; // what the master actually clocked
+        if (rx_bits == 0) {
+            continue;
+        }
+        size_t rx_len = rx_bits / 8;
+        if ((rx_bits % 8) != 0 || !frame_shape_ok(rx_buf, rx_len)) {
+            // caught the tail of a frame: no reply staged, the master resyncs
+            ESP_LOGW("OMNI", "dropping misaligned frame: %u bits, first byte %02x",
+                     (unsigned)rx_bits, rx_buf[0]);
+            continue;
+        }
+
         uint8_t incoming_command = rx_buf[0];
 
-        // 0x00 = "empty": master is only clocking out our last-prepared
-        // response, not submitting new work - leave tx_buf as-is
-        if (incoming_command != 0x00) {
-            switch (incoming_command)
-            {
-                case 0x0A: {
-                    // status |= EXT_MCU_ON_FLAG; // report on
+        switch (incoming_command)
+        {
+            case BRIDGE_CMD_NONE:
+                // master is only clocking out our last-prepared reply, not
+                // submitting new work - leave tx_buf as-is
+                break;
 
-                    tx_buf[0] = incoming_command | 0x80; // tag so the master knows which command this answers
-                    tx_buf[1] = status_flags;
-                    // ESP_LOGI("OMNI", "queued response %02x %02x for command %02x", tx_buf[0], tx_buf[1], incoming_command);
-                    break;
-                }
+            case BRIDGE_CMD_STATUS: {
+                bridge_reply(tx_buf, incoming_command, &status_flags, 1);
+                break;
+            }
 
-                default:
-                    ESP_LOGW("OMNI", "Unknown command: %02x", incoming_command);
-                    break;
+            case BRIDGE_CMD_VERSION: {
+                // 32 bytes, NUL padded - whatever the build stamped into the
+                // app descriptor (git describe unless version.txt / PROJECT_VER
+                // says otherwise). The nRF compares this against the image it
+                // just sent before it confirms.
+                const esp_app_desc_t *desc = esp_app_get_description();
+                bridge_reply(tx_buf, incoming_command, desc->version, sizeof(desc->version));
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_BEGIN: {
+                // [cmd][size u32]
+                uint8_t res = ota_ctl_begin(rd32(&rx_buf[1]));
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_DATA: {
+                // [cmd][seq u16][len u16][payload][crc32]; lengths already
+                // checked by frame_shape_ok
+                uint16_t seq = rd16(&rx_buf[1]);
+                uint16_t len = rd16(&rx_buf[3]);
+                const uint8_t *payload = &rx_buf[BRIDGE_OTA_DATA_HDR_LEN];
+                uint8_t res = ota_ctl_write_block(seq, payload, len, rd32(payload + len));
+                ota_state_report_t st;
+                ota_ctl_get_state(&st);
+                uint8_t reply[3] = { res, (uint8_t)st.next_seq, (uint8_t)(st.next_seq >> 8) };
+                bridge_reply(tx_buf, incoming_command, reply, sizeof(reply));
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_END: {
+                uint8_t res = ota_ctl_end();
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_STATE: {
+                ota_state_report_t st;
+                ota_ctl_get_state(&st);
+                uint8_t reply[6] = {
+                    (uint8_t)st.state,
+                    (uint8_t)st.err,      (uint8_t)(st.err >> 8),
+                    (uint8_t)st.next_seq, (uint8_t)(st.next_seq >> 8),
+                    st.percent,
+                };
+                bridge_reply(tx_buf, incoming_command, reply, sizeof(reply));
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_REBOOT: {
+                uint8_t res = ota_ctl_reboot();
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_CONFIRM: {
+                uint8_t res = ota_ctl_confirm();
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
+            }
+
+            case BRIDGE_CMD_OTA_ABORT: {
+                uint8_t res = ota_ctl_abort();
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
+            }
+
+            default: {
+                ESP_LOGW("OMNI", "Unknown command: %02x", incoming_command);
+                uint8_t res = BRIDGE_RESULT_UNKNOWN_CMD;
+                bridge_reply(tx_buf, incoming_command, &res, 1);
+                break;
             }
         }
 

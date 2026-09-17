@@ -4,7 +4,8 @@ idf_component_register(SRCS "bt_app_av.c"
                             "bridge.c"
                             "sfx.c"
                             "audio_out.c"
-                    PRIV_REQUIRES esp_driver_i2s bt nvs_flash esp_ringbuf esp_driver_spi esp_partition esp_timer
+                            "ota_ctl.c"
+                    PRIV_REQUIRES esp_driver_i2s esp_driver_gpio bt nvs_flash esp_ringbuf esp_driver_spi esp_partition esp_timer app_update esp_app_format
                     INCLUDE_DIRS ".")
 
 # Write the packed sound bank into the 'audio' partition whenever the app is

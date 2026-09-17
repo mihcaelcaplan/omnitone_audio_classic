@@ -28,6 +28,9 @@
 #include "audio_out.h"
 #include "bridge.h"
 #include "sfx.h"
+#include "ota_ctl.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 
 
 //parameters :)
@@ -240,6 +243,18 @@ void app_main(void)
         "|                                                  |\n"
         "+~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=+");
 
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *slot = esp_ota_get_running_partition();
+    ESP_LOGI("OMNI", "firmware %s  built %s %s  idf %s  running from %s @ 0x%lx",
+             app->version, app->date, app->time, app->idf_ver,
+             slot ? slot->label : "?", slot ? (unsigned long)slot->address : 0UL);
+
+    /* Before the SPI task so the first status poll already carries the OTA
+     * bits; before NVS so a pending-confirm boot starts its clock as early as
+     * possible. Only reads otadata, so it does not race the chime's flash rule
+     * further down. */
+    ota_ctl_init();
+
     // start up the spi handler task to be a peripheral to the NRF chip
     err = init_SPI();
     if(err != ESP_OK){
@@ -296,7 +311,8 @@ void app_main(void)
      * antenna's fault and not the controller's. Must come after the controller
      * is enabled. The floor is left at N0 rather than raised - the controller
      * still walks power down over a short link, which is what we want. */
-    if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9)) != ESP_OK) {
+    // if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9)) != ESP_OK) {
+    if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9)) != ESP_OK) { // TODO: change this 
         ESP_LOGW(BT_AV_TAG, "%s set tx power failed: %s", __func__, esp_err_to_name(err));
     }
 
