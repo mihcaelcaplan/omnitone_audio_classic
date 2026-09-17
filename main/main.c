@@ -218,6 +218,10 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         /* go looking for whoever we were last paired with. we stay connectable
          * the whole time, so a device that comes to us first still wins */
         bt_av_reconnect_start();
+
+        /* the stack is up and every bring-up call that could race a flash
+         * erase is behind us: a firmware update may now take it down */
+        ota_ctl_bt_bringup_done();
         break;
     }
     /* others */
@@ -299,10 +303,12 @@ void app_main(void)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if ((err = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
     if ((err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 
@@ -311,8 +317,7 @@ void app_main(void)
      * antenna's fault and not the controller's. Must come after the controller
      * is enabled. The floor is left at N0 rather than raised - the controller
      * still walks power down over a short link, which is what we want. */
-    // if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9)) != ESP_OK) {
-    if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9)) != ESP_OK) { // TODO: change this 
+    if ((err = esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9)) != ESP_OK) {
         ESP_LOGW(BT_AV_TAG, "%s set tx power failed: %s", __func__, esp_err_to_name(err));
     }
 
@@ -322,11 +327,13 @@ void app_main(void)
 #endif
     if ((err = esp_bluedroid_init_with_cfg(&bluedroid_cfg)) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s initialize bluedroid failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 
     if ((err = esp_bluedroid_enable()) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "%s enable bluedroid failed: %s", __func__, esp_err_to_name(err));
+        ota_ctl_bt_bringup_done(); // nothing will enable the radio now; let an update through
         return;
     }
 

@@ -66,4 +66,12 @@ void ota_ctl_get_state(ota_state_report_t *out);
 // slot holds an image that was rolled back it raises EXT_MCU_OTA_ERROR_FLAG.
 void ota_ctl_init(void);
 
+// Call once Bluetooth bring-up is over, one way or the other: after the stack
+// is up and configured, or when app_main gives up on the controller. The SPI
+// task starts before the controller does, and an erase under a controller that
+// is still being enabled ends in a controller assert, so an OTA_BEGIN that
+// arrives earlier sits in ERASING until this is called (or times out into
+// OTA_STATE_ERROR after 20 s).
+void ota_ctl_bt_bringup_done(void);
+
 #endif

@@ -48,7 +48,7 @@
  * roughly 20s of trying -- which is also what paces the retries, see
  * bt_av_reconnect_page_next(). */
 #define RECONNECT_MAX_PEERS              (2)
-#define RECONNECT_MAX_ATTEMPTS           (1)
+#define RECONNECT_MAX_ATTEMPTS           (4)
 
 /* How close to the disconnect a stream stopping still counts as "the link took
  * the music with it" rather than "somebody pressed pause". Measured gap is about

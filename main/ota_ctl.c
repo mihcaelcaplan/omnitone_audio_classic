@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -29,6 +30,12 @@ static const char *TAG = "OMNI_OTA";
 #define OTA_WORKER_STACK 8192
 #define OTA_WORKER_PRIO  5
 
+// how long the erase task will wait for Bluetooth bring-up to finish before
+// giving up on the update. Bring-up is a couple of seconds; the nRF's erase
+// timeout is 60 s and this has to fit inside it.
+#define BT_READY_BIT        (1u << 0)
+#define OTA_BT_READY_WAIT_MS 20000
+
 typedef enum {
     DEFERRED_NONE = 0,
     DEFERRED_RESTART,   // after OTA_REBOOT
@@ -47,6 +54,7 @@ static struct {
     const esp_partition_t *target;
     esp_ota_handle_t handle;
     bool handle_open;
+    EventGroupHandle_t bt_ready;  // BT_READY_BIT once Bluetooth bring-up is over; the erase waits for it
     bool bt_down;           // Bluetooth was shut down for this update; only a reset brings it back
     bool abort_requested;   // OTA_ABORT arrived while a worker was mid-erase / mid-verify
     deferred_action_t deferred_action;
@@ -145,6 +153,26 @@ static void enter_error(esp_err_t err, const char *what)
     restart_if_bt_down();
 }
 
+/* Lock held. Undo the esp_ota_set_boot_partition(target) that READY_TO_REBOOT
+ * did. Pointing otadata back at the running slot is not enough on its own:
+ * with app rollback on, esp_ota_set_boot_partition() writes a fresh entry in
+ * state NEW, the bootloader promotes that to PENDING_VERIFY on the restart
+ * that follows, and this image - the one that has been running fine all along
+ * - comes back up PENDING_CONFIRM. The nRF sees the old version string, does
+ * not confirm, and the confirm timeout then rolls "back" into the very image
+ * that was just aborted. Marking the entry VALID right away keeps the running
+ * image a plain known-good boot. */
+static void restore_running_partition(void)
+{
+    esp_err_t err = esp_ota_set_boot_partition(esp_ota_get_running_partition());
+    if (err == ESP_OK) {
+        err = esp_ota_mark_app_valid_cancel_rollback();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "restoring the running partition as boot: %s", esp_err_to_name(err));
+    }
+}
+
 /*******************************
  * WORKERS AND TIMERS
  ******************************/
@@ -152,6 +180,23 @@ static void enter_error(esp_err_t err, const char *what)
 static void erase_task(void *arg)
 {
     esp_ota_handle_t h = 0;
+
+    // The SPI task is up before the controller is, and the nRF starts a queued
+    // update as soon as STATUS replies arrive. An OTA_BEGIN that lands in that
+    // window has nothing to shut down yet, and app_main would then enable the
+    // controller underneath the erase. So wait for bring-up to finish first;
+    // we are already reporting ERASING, which the nRF gives 60 s.
+    if (!(xEventGroupWaitBits(s.bt_ready, BT_READY_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(OTA_BT_READY_WAIT_MS)) & BT_READY_BIT)) {
+        LOCK();
+        if (s.abort_requested) {
+            to_idle("aborted while waiting for Bluetooth bring-up");
+        } else {
+            enter_error(ESP_ERR_TIMEOUT, "Bluetooth bring-up never finished");
+        }
+        UNLOCK();
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Bluetooth first, and all the way down. The controller runs to hard
     // real-time deadlines and a sector erase stalls both cores' caches; with a
@@ -248,7 +293,7 @@ static void idle_timeout_cb(void *arg)
     if (s.state == OTA_STATE_RECEIVING || s.state == OTA_STATE_READY_TO_REBOOT) {
         if (s.state == OTA_STATE_READY_TO_REBOOT) {
             // the new slot is already selected; put the running one back
-            esp_ota_set_boot_partition(esp_ota_get_running_partition());
+            restore_running_partition();
         }
         enter_error(ESP_ERR_TIMEOUT, "nRF went quiet");
     }
@@ -463,7 +508,7 @@ ota_result_t ota_ctl_abort(void)
             res = OTA_RES_BAD_STATE; // restart already in flight
             break;
         }
-        esp_ota_set_boot_partition(esp_ota_get_running_partition());
+        restore_running_partition();
         to_idle("OTA_ABORT, boot partition restored");
         break;
 
@@ -496,6 +541,11 @@ void ota_ctl_get_state(ota_state_report_t *out)
     UNLOCK();
 }
 
+void ota_ctl_bt_bringup_done(void)
+{
+    xEventGroupSetBits(s.bt_ready, BT_READY_BIT);
+}
+
 /*******************************
  * BOOT
  ******************************/
@@ -505,6 +555,8 @@ void ota_ctl_init(void)
     memset(&s, 0, sizeof(s));
     s.lock = xSemaphoreCreateMutex();
     assert(s.lock != NULL);
+    s.bt_ready = xEventGroupCreate();
+    assert(s.bt_ready != NULL);
 
     const esp_timer_create_args_t deferred_args = { .callback = deferred_cb, .name = "ota_deferred" };
     const esp_timer_create_args_t confirm_args  = { .callback = confirm_timeout_cb, .name = "ota_confirm" };
